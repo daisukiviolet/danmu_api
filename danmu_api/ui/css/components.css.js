@@ -1,6 +1,36 @@
 // language=CSS
 export const componentsCssContent = /* css */ `
-/* 组件样式 — 参照 Bangumi-syncer ACG 设计系统 */
+/* 组件样式 — 参照 Bangumi-syncer 柔和圆角设计风格 */
+
+/* ============ 图标 ============ */
+/* 统一线性图标：尺寸随字号（1em），描边取 currentColor */
+.ui-icon-sprite {
+    position: absolute;
+    width: 0;
+    height: 0;
+    overflow: hidden;
+}
+
+.ui-icon {
+    display: inline-block;
+    flex: none;
+    width: 1em;
+    height: 1em;
+    vertical-align: -0.125em;
+}
+
+/* GitHub 标识：官方实心图形，固定 14px 显示 */
+.ui-icon.github-icon {
+    width: 14px;
+    height: 14px;
+}
+
+/* 图标与文字成对出现时的对齐容器（flex 居中） */
+.ui-icon-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4em;
+}
 
 /* ============ 标签导航 ============ */
 .nav-buttons {
@@ -152,7 +182,10 @@ export const componentsCssContent = /* css */ `
     font-size: 13px;
     font-weight: 500;
     transition: all 0.22s var(--app-ease-smooth);
-    display: inline-block;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
     text-align: center;
     line-height: 1.4;
 }
@@ -248,6 +281,239 @@ body[data-theme] .favorite-schedule-btn:disabled:hover {
 
 .favorite-list {
     margin-top: 8px;
+}
+
+.local-danmu-file-field input[type="file"] {
+    min-height: 48px;
+    padding: 6px;
+    border-radius: var(--app-radius-btn);
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.local-danmu-file-field input[type="file"]::file-selector-button {
+    margin-right: 12px;
+    padding: 9px 18px;
+    border: none;
+    border-radius: 10px;
+    background: linear-gradient(135deg, var(--theme-accent), var(--theme-accent-hover));
+    color: #ffffff;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+    box-shadow: 0 2px 6px var(--theme-accent-soft);
+    transition: filter 0.2s ease, box-shadow 0.2s ease;
+}
+
+.local-danmu-file-field input[type="file"]::file-selector-button:hover {
+    filter: brightness(1.06);
+    box-shadow: 0 3px 10px var(--theme-accent-soft);
+}
+
+.local-danmu-file-field input[type="file"]::file-selector-button:active {
+    filter: brightness(0.96);
+}
+
+.local-danmu-file-hint {
+    margin: 7px 0 0;
+    color: var(--theme-muted);
+    font-size: 12px;
+    line-height: 1.6;
+}
+
+.local-danmu-fields {
+    display: grid;
+    grid-template-columns: minmax(190px, 2fr) repeat(4, minmax(100px, 1fr)) auto;
+    align-items: end;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.local-danmu-fields[data-batch="true"] {
+    grid-template-columns: minmax(190px, 2fr) repeat(3, minmax(100px, 1fr)) auto;
+}
+
+.local-danmu-fields .form-group {
+    display: flex;
+    flex-direction: column;
+    margin-bottom: 0;
+    min-width: 0;
+}
+
+.local-danmu-fields .form-group[hidden] {
+    display: none;
+}
+
+.local-danmu-fields .form-group label {
+    min-height: 18px;
+    margin-bottom: 6px;
+    line-height: 18px;
+    white-space: nowrap;
+}
+
+.local-danmu-fields .form-group input,
+.local-danmu-fields .form-group select {
+    box-sizing: border-box;
+    width: 100%;
+    height: 42px;
+    min-height: 42px;
+    margin: 0;
+    padding: 10px 14px;
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 20px;
+}
+
+.local-danmu-fields select {
+    cursor: pointer;
+}
+
+.local-danmu-fields > button {
+    height: 42px;
+    min-height: 42px;
+}
+
+.local-danmu-batch-preview {
+    margin-top: 12px;
+}
+
+#local-danmu-upload-status {
+    overflow-wrap: anywhere;
+}
+
+.local-danmu-batch-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 90px minmax(120px, 0.65fr);
+    align-items: center;
+    gap: 12px;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--theme-border);
+}
+
+.local-danmu-batch-file {
+    min-width: 0;
+}
+
+.local-danmu-batch-episode {
+    margin: 0;
+}
+
+.local-danmu-batch-status {
+    color: var(--theme-muted);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+}
+
+@media (max-width: 600px) {
+    .local-danmu-batch-row {
+        grid-template-columns: minmax(0, 1fr) 90px;
+    }
+    .local-danmu-batch-status {
+        grid-column: 1 / -1;
+    }
+}
+
+.local-danmu-search {
+    max-width: 480px;
+    margin: 18px 0 12px;
+}
+
+.local-danmu-group {
+    margin-bottom: 12px;
+    border: 1px solid var(--theme-border);
+    border-radius: var(--app-radius-card-sm);
+    background: var(--theme-input-bg);
+    overflow: hidden;
+}
+
+.local-danmu-group > summary {
+    padding: 14px 16px;
+    cursor: pointer;
+    color: var(--theme-text);
+    overflow-wrap: anywhere;
+}
+
+.local-danmu-group-actions {
+    display: flex;
+    gap: 8px;
+    margin: 0 16px 8px 34px;
+}
+
+.local-danmu-group > summary::marker {
+    color: var(--theme-accent);
+}
+
+.local-danmu-group[open] > summary {
+    border-bottom: 1px solid var(--theme-border);
+}
+
+.local-danmu-group-title {
+    font-size: 15px;
+    font-weight: 600;
+}
+
+.local-danmu-group-meta,
+.local-danmu-group-count {
+    display: block;
+    margin: 5px 0 0 18px;
+    font-size: 12px;
+    color: var(--theme-muted);
+}
+
+.local-danmu-episodes {
+    margin: 8px 16px 12px 34px;
+    padding: 0 0 0 16px;
+    border-left: 2px solid var(--theme-border);
+}
+
+.local-danmu-episode {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--theme-border);
+}
+
+.local-danmu-episode:last-child {
+    border-bottom: 0;
+}
+
+.local-danmu-episode-info {
+    min-width: 0;
+    margin-left: 12px;
+}
+
+.local-danmu-episode-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--theme-text);
+}
+
+.local-danmu-filename,
+.local-danmu-episode-meta {
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--theme-muted);
+    overflow-wrap: anywhere;
+}
+
+.local-danmu-episode-actions {
+    display: flex;
+    flex-shrink: 0;
+    gap: 8px;
+}
+
+@media (max-width: 960px) {
+    .local-danmu-fields,
+    .local-danmu-fields[data-batch="true"] {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .local-danmu-name-field,
+    .local-danmu-fields > button {
+        grid-column: 1 / -1;
+    }
 }
 
 .btn-primary {
@@ -534,7 +800,7 @@ body[data-theme] .favorite-schedule-btn:disabled:hover {
     display: grid;
     place-items: center;
     color: var(--theme-muted);
-    font-size: 24px;
+    font-size: 16px;
     line-height: 1;
 }
 
@@ -545,7 +811,7 @@ body[data-theme] .favorite-schedule-btn:disabled:hover {
 .preview-group-heading {
     min-height: 32px;
     display: flex;
-    align-items: baseline;
+    align-items: center;
     justify-content: space-between;
     gap: 10px;
     padding: 0 2px 8px;
@@ -655,6 +921,9 @@ body[data-theme] .favorite-schedule-btn:disabled:hover {
 
 .preview-copy-btn {
     padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     font-size: 16px;
 }
 
@@ -686,6 +955,7 @@ body[data-theme] .favorite-schedule-btn:disabled:hover {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    margin-top: 14px;
     margin-bottom: 12px;
     flex-wrap: wrap;
     gap: 8px;
@@ -1340,38 +1610,6 @@ body[data-theme] input[type="checkbox"].app-checkbox:focus-visible {
     justify-content: center;
 }
 
-/* ============ Bilibili Cookie ============ */
-.bili-cookie-editor {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-}
-
-.bili-cookie-status {
-    background: var(--theme-panel-bg);
-    padding: 12px;
-    border-radius: var(--app-radius-card-sm);
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    border-left: 3px solid var(--theme-accent);
-}
-
-.bili-status-icon {
-    font-size: 18px;
-}
-
-.bili-status-text {
-    flex: 1;
-    font-weight: 500;
-    font-size: 13px;
-}
-
-.bili-cookie-actions {
-    display: flex;
-    gap: 8px;
-}
-
 /* ============ 多选标签 & 合并模式 ============ */
 .selected-tag {
     display: inline-flex;
@@ -1566,6 +1804,7 @@ body[data-theme] input[type="checkbox"].app-checkbox:focus-visible {
 
 .confirm-merge-btn:disabled {
     background: var(--theme-panel-strong);
+    color: var(--theme-muted);
     cursor: not-allowed;
     box-shadow: none;
 }
@@ -1692,11 +1931,6 @@ body[data-theme] input[type="checkbox"].app-checkbox:focus-visible {
     padding-bottom: 0;
 }
 
-.record-timestamp::before {
-    content: '\\1F550';
-    font-size: 14px;
-}
-
 .record-params {
     background: var(--theme-panel-strong);
     border-radius: var(--app-radius-card-sm);
@@ -1711,11 +1945,6 @@ body[data-theme] input[type="checkbox"].app-checkbox:focus-visible {
     display: flex;
     align-items: center;
     gap: 6px;
-}
-
-.record-params-title::before {
-    content: '\\1F4CB';
-    font-size: 14px;
 }
 
 .record-params pre {
@@ -2213,7 +2442,9 @@ body[data-theme] input[type="checkbox"].app-checkbox:focus-visible {
     color: var(--theme-muted);
     transition: all 0.22s var(--app-ease-smooth);
     margin-bottom: 14px;
-    display: inline-block;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
 }
 
 .btn-back:hover {
@@ -2825,14 +3056,18 @@ body[data-theme$="-dark"] .heatmap-bar {
     border-radius: 8px;
 }
 
-/* ============ AI API Key 编辑器 ============ */
-.ai-apikey-editor {
+/* ============ 凭证编辑器（AI API Key / 弹弹play密码 / B站 Cookie 共用） ============ */
+.ai-apikey-editor,
+.dandanplay-editor,
+.bili-cookie-editor {
     display: flex;
     flex-direction: column;
     gap: 14px;
 }
 
-.ai-apikey-status {
+.ai-apikey-status,
+.dandanplay-status,
+.bili-cookie-status {
     background: var(--theme-panel-bg);
     padding: 12px;
     border-radius: var(--app-radius-card-sm);
@@ -2842,17 +3077,23 @@ body[data-theme$="-dark"] .heatmap-bar {
     border-left: 3px solid var(--theme-accent);
 }
 
-.ai-status-icon {
+.ai-status-icon,
+.dandanplay-status-icon,
+.bili-status-icon {
     font-size: 18px;
 }
 
-.ai-status-text {
+.ai-status-text,
+.dandanplay-status-text,
+.bili-status-text {
     flex: 1;
     font-weight: 500;
     font-size: 13px;
 }
 
-.ai-apikey-actions {
+.ai-apikey-actions,
+.dandanplay-actions,
+.bili-cookie-actions {
     display: flex;
     gap: 8px;
 }

@@ -12,11 +12,17 @@ import { handleRequest } from './worker.js';
 import { Globals, globals } from './configs/globals.js';
 import { Envs } from './configs/envs.js';
 import { clearBangumiDataCache, initBangumiData, syncBangumiDataLifecycleOnConfigChange } from './utils/bangumi-data-util.js';
-import { getLocalCaches, judgeLocalCacheValid } from './utils/cache-util.js';
-import { getRedisCaches, judgeRedisValid } from './utils/redis-util.js';
+import { judgeRedisValid, initializePersistentCaches } from './utils/redis-util.js';
 import { persistFavorites, refreshFavoriteByKeyword } from './apis/favorite-api.js';
 import { startFavoriteScheduler, stopFavoriteScheduler } from './utils/favorite-schedule-util.js';
 import { formatHostForUrl, listenOnAllInterfaces } from './utils/server-listen-util.js';
+
+// 读取 Node HTTP 请求体的原始字节，避免多字节字符和上传文件在分块读取时被破坏。
+async function readRequestBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
 
 // =====================
 // server.js - 本地node智能启动脚本：根据 Node.js 环境自动选择最优启动模式
@@ -339,12 +345,8 @@ function createServer() {
 
       // 异步读取 POST/PUT 请求的请求体
       let body;
-      if (req.method === 'POST' || req.method === 'PUT') {
-        body = await new Promise((resolve) => {
-          let data = '';
-          req.on('data', chunk => data += chunk);
-          req.on('end', () => resolve(data));
-        });
+      if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
+        body = await readRequestBody(req);
       }
 
       // 创建一个 Web API 兼容的 Request 对象
@@ -544,11 +546,8 @@ async function startServer() {
 }
 
 async function initializeFavoriteScheduler(mainPort) {
-  await judgeLocalCacheValid('/api/v2/favorite/list', 'node');
-  if (Globals.localCacheValid) await getLocalCaches();
-
   await judgeRedisValid('/api/v2/favorite/list');
-  if (Globals.redisValid) await getRedisCaches();
+  await initializePersistentCaches('node');
 
   const refreshUrl = new URL(`http://127.0.0.1:${mainPort}/api/v2/favorite/refresh`);
   await startFavoriteScheduler({
