@@ -8,26 +8,80 @@ on:
         - cron: "0 0 * * *"  # 每天午夜执行
     workflow_dispatch:  # 允许手动触发
 
+concurrency:
+    group: fork-sync-${{ github.ref }}
+    cancel-in-progress: false
+
 jobs:
     sync_with_upstream:
         name: Sync with Upstream
-        runs-on: ubuntu-latest
+        # 固定 runner 版本，避免 ubuntu-latest 在 2026-10-19 迁移到 Ubuntu 26 时行为漂移
+        runs-on: ubuntu-24.04
         if: ${{ github.event.repository.fork }}
 
         steps:
+            # 用支持 Node 24 的 v5，消除 "Node.js 20 is deprecated" 强制升级告警
             - name: Checkout target repo
-              uses: actions/checkout@v4
+              uses: actions/checkout@v5
               with:
-                token: ${{ secrets.GITHUB_TOKEN }}
+                  token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+                  fetch-depth: 0   # 必须是完整历史，否则无法与上游比对祖先关系
 
-            - name: Sync Upstream
-              uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
-              with:
-                  target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-                  upstream_sync_repo: huangxd-/danmu_api
-                  upstream_sync_branch: main
-                  target_sync_branch: main
-                  test_mode: false
+            - name: Sync with Upstream
+              env:
+                  UPSTREAM_REPO: huangxd-/danmu_api
+                  UPSTREAM_BRANCH: main
+                  TARGET_BRANCH: main
+                  SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+                  DEFAULT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  set -euo pipefail
+
+                  git config user.name  "github-actions[bot]"
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+                  # fork 跨库推送需要 repo 权限；GITHUB_TOKEN 只能操作本库，
+                  # 这里优先用 PAT，未配置时回退，至少保证 fetch 能work。
+                  TOKEN="${SYNC_TOKEN:-$DEFAULT_TOKEN}"
+
+                  git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+                  git fetch upstream "${UPSTREAM_BRANCH}" --no-tags
+                  git fetch origin   "${TARGET_BRANCH}" --no-tags
+
+                  echo "::group::Upstream latest"
+                  git --no-pager log --oneline -5 "upstream/${UPSTREAM_BRANCH}"
+                  echo "::endgroup::"
+
+                  echo "::group::Fork latest"
+                  git --no-pager log --oneline -5 "origin/${TARGET_BRANCH}"
+                  echo "::endgroup::"
+
+                  # 已经包含上游最新提交 → 无事可做
+                  if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" "origin/${TARGET_BRANCH}"; then
+                      echo "Already up to date with upstream. Nothing to sync."
+                      exit 0
+                  fi
+
+                  # fork HEAD 是上游祖先 → 可以安全快进，本地无独有提交会丢失
+                  if git merge-base --is-ancestor "origin/${TARGET_BRANCH}" "upstream/${UPSTREAM_BRANCH}"; then
+                      echo "Fork is behind upstream -> fast-forwarding."
+                      git checkout -B "${TARGET_BRANCH}" "origin/${TARGET_BRANCH}"
+                      git merge --ff-only "upstream/${UPSTREAM_BRANCH}"
+                  else
+                      # 真正分叉：说明 fork 上有本地改动。
+                      # 不再盲目强推覆盖，而是明确报错让人决策，避免静默丢代码。
+                      echo "::error::Fork has diverged from upstream. Manual review required."
+                      echo "Fork-only commits:"
+                      git --no-pager log --oneline "upstream/${UPSTREAM_BRANCH}..origin/${TARGET_BRANCH}" | head -20
+                      exit 1
+                  fi
+
+                  # 快进推送无需 force。用带 token 的地址推送。
+                  git push \
+                      "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git" \
+                      "HEAD:${TARGET_BRANCH}"
+
+                  echo "Sync completed. Fork now matches upstream/${UPSTREAM_BRANCH}."
 
             - name: Check for new commits
               if: success()
