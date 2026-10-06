@@ -62,21 +62,57 @@ jobs:
                       exit 0
                   fi
 
-                  # fork HEAD 是上游祖先 → 可以安全快进，本地无独有提交会丢失
+                  # fork HEAD 是上游祖先 → 纯落后，直接快进
                   if git merge-base --is-ancestor "origin/${TARGET_BRANCH}" "upstream/${UPSTREAM_BRANCH}"; then
                       echo "Fork is behind upstream -> fast-forwarding."
                       git checkout -B "${TARGET_BRANCH}" "origin/${TARGET_BRANCH}"
                       git merge --ff-only "upstream/${UPSTREAM_BRANCH}"
                   else
-                      # 真正分叉：说明 fork 上有本地改动。
-                      # 不再盲目强推覆盖，而是明确报错让人决策，避免静默丢代码。
-                      echo "::error::Fork has diverged from upstream. Manual review required."
-                      echo "Fork-only commits:"
-                      git --no-pager log --oneline "upstream/${UPSTREAM_BRANCH}..origin/${TARGET_BRANCH}" | head -20
-                      exit 1
+                      # 分叉：fork 有自己的提交（通常是 .github/workflows 里的自定义配置）。
+                      # 策略是「上游优先，保留 fork 自己的那些文件」：
+                      #   1. 把上游合并进来，冲突时一律取上游版本（-X theirs）
+                      #   2. 再把 fork 独有提交里改动过的文件还原成 fork 的版本
+                      # 这样既跟上上游，又不会丢掉 fork 的自定义工作流。
+                      echo "Fork has its own commits -> merging upstream, then restoring fork-only files."
+
+                      git checkout -B "${TARGET_BRANCH}" "origin/${TARGET_BRANCH}"
+
+                      # 先记下 fork 独有提交里修改过的文件清单
+                      FORK_FILES=$(git diff --name-only \
+                          "$(git merge-base "origin/${TARGET_BRANCH}" "upstream/${UPSTREAM_BRANCH}")" \
+                          "origin/${TARGET_BRANCH}")
+
+                      echo "::group::Fork-only changed files"
+                      echo "${FORK_FILES}"
+                      echo "::endgroup::"
+
+                      # 合并上游；冲突时以「上游」为准（-X theirs 在本上下文指 upstream 侧）
+                      if ! git merge --no-edit -X theirs "upstream/${UPSTREAM_BRANCH}"; then
+                          echo "::warning::Merge had conflicts even with -X theirs; aborting to be safe."
+                          git merge --abort || true
+                          echo "::error::Manual merge required. No changes were pushed."
+                          exit 1
+                      fi
+
+                      # 把 fork 独有改动过的文件还原成 fork 的内容（保留下自定义配置）
+                      # 仅处理仍然存在的文件，避免上游已删除的文件导致报错。
+                      if [ -n "${FORK_FILES}" ]; then
+                          while IFS= read -r f; do
+                              [ -z "$f" ] && continue
+                              if git cat-file -e "origin/${TARGET_BRANCH}:${f}" 2>/dev/null; then
+                                  git checkout "origin/${TARGET_BRANCH}" -- "$f" 2>/dev/null || true
+                                  echo "restored fork version: $f"
+                              fi
+                          done <<< "${FORK_FILES}"
+
+                          git add -A
+                          if ! git diff --cached --quiet; then
+                              git commit -m "chore: preserve fork-specific files after upstream sync" || true
+                          fi
+                      fi
                   fi
 
-                  # 快进推送无需 force。用带 token 的地址推送。
+                  # 推送。分叉合并不需要 force；若因历史原因需要，用 --force-with-lease 更安全。
                   git push \
                       "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git" \
                       "HEAD:${TARGET_BRANCH}"
