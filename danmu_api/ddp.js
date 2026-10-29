@@ -40,6 +40,36 @@ async function readBody(req) {
   return Buffer.concat(chunks);
 }
 
+// 上游超时与重试：单次 8 秒封顶，最多试 2 次。
+// 实测个别关键词会挂到 10 秒以上（同一时刻直连网关只要 1.5 秒），
+// 不自己掐表的话函数会被平台杀掉，客户端拿到的是空响应而不是错误信息。
+const UPSTREAM_TIMEOUT_MS = 8000;
+const UPSTREAM_RETRY = 2;
+
+async function fetchOnce(url, init) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchWithRetry(url, init) {
+  let lastErr;
+  for (let i = 0; i < UPSTREAM_RETRY; i++) {
+    try {
+      // 重试时在已编码的 path 参数后追加 _t，绕开 CF 对上次失败响应的中间缓存
+      const attemptUrl = i === 0 ? url : url + "%26_t%3D" + Date.now();
+      return await fetchOnce(attemptUrl, init);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("upstream failed after retries");
+}
+
 export default async function handler(req, res) {
   const rawUrl = req.url || "/";
   const qIndex = rawUrl.indexOf("?");
@@ -89,7 +119,9 @@ export default async function handler(req, res) {
   }
 
   try {
-    const upstream = await fetch(target, {
+    // 上游偶发卡死：直连网关通常 1.5-2s，但走 Vercel 出口时会莫名其妙挂到 10s 以上，
+    // 不设超时的话函数被平台杀掉，客户端只能拿到空响应。这里自己掐表 + 重试一次。
+    const upstream = await fetchWithRetry(target, {
       method: req.method,
       headers: {
         "User-Agent": UA,
