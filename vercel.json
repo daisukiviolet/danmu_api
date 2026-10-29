@@ -4,12 +4,24 @@
     {
       "src": "danmu_api/worker.js",
       "use": "@vercel/node"
+    },
+    {
+      "src": "danmu_api/ddp.js",
+      "use": "@vercel/node"
     }
   ],
   "routes": [
     {
       "src": "/",
       "dest": "/danmu_api/worker.js"
+    },
+    {
+      "src": "/ddp/(.*)",
+      "dest": "/danmu_api/ddp.js"
+    },
+    {
+      "src": "/ddp",
+      "dest": "/danmu_api/ddp.js"
     },
     {
       "src": "/api/(.*)",
