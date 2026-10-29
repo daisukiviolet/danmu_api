@@ -16,11 +16,14 @@ const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// CDN 缓存 TTL（秒）。弹幕库几乎不变，缓存越久，网关压力和响应延迟越低。
+// CDN 缓存 TTL（秒）。
+// 上游 danmaku-anywhere 网关自己已经缓存 1 小时（实测 CF-Cache-Status: HIT, Age: 1391），
+// 所以这里必须压短，否则新番当天会出现「网关 1 小时 + 本层 N 小时」的叠加延迟。
+// 弹幕只给 10 分钟，元数据类放宽。
 const TTL_RULES = [
-  [/^\/v2\/comment\//i, 21600],   // 6 小时
-  [/^\/v2\/search\//i, 3600],     // 1 小时
-  [/^\/v2\/bangumi\//i, 86400],   // 1 天
+  [/^\/v2\/comment\//i, 600],     // 10 分钟：新番更新当天要能追
+  [/^\/v2\/search\//i, 1800],     // 30 分钟
+  [/^\/v2\/bangumi\//i, 21600],   // 6 小时：番剧元数据基本不变
   [/^\/v2\/match/i, 3600],
 ];
 
@@ -53,6 +56,8 @@ export default async function handler(req, res) {
         upstream: UPSTREAM,
         usage: "把 /ddp 填到播放器的「弹幕 API 基础地址」，请求会转发到 " + UPSTREAM,
         selfTest: "/ddp/api/v2/search/episodes?anime=进击的巨人",
+        forceRefresh: "任意请求加 &fresh=1 可跳过本层与上游网关缓存，取最新弹幕",
+        cacheTTL: "comment 10min / search 30min / bangumi 6h",
       })
     );
     return;
@@ -68,7 +73,14 @@ export default async function handler(req, res) {
     return;
   }
 
-  const inner = path + (query ? "?" + query : "");
+  // fresh=1：强制穿透两层缓存（本层 CDN + 上游网关的 1 小时缓存）。
+  // 播放器不会传，是给「新番刚更新、要立即看最新弹幕」的手动刷新用的。
+  const isFresh = /(^|&)fresh=1(&|$)/.test(query);
+  const innerQuery = isFresh
+    ? (query ? query + "&" : "") + "_t=" + Math.floor(Date.now() / 1000)
+    : query;
+
+  const inner = path + (innerQuery ? "?" + innerQuery : "");
   const target = UPSTREAM + "?path=" + encodeURIComponent(inner);
 
   let body;
@@ -92,8 +104,8 @@ export default async function handler(req, res) {
     res.statusCode = upstream.status;
     res.setHeader("Content-Type", upstream.headers.get("content-type") || "application/json");
 
-    // 只缓存成功且幂等的 GET；POST（文件识别）一律不缓存
-    if (upstream.status === 200 && req.method === "GET") {
+    // 只缓存成功且幂等的 GET；POST（文件识别）和 fresh=1 一律不缓存
+    if (upstream.status === 200 && req.method === "GET" && !isFresh) {
       res.setHeader(
         "Cache-Control",
         `public, s-maxage=${ttlFor(path)}, stale-while-revalidate=86400`
