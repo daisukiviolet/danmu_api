@@ -381,8 +381,8 @@ async function viaAppSearch(keyword) {
 // PGC 季库与 App 搜索在没有关键词命中时会回落成「热门列表」，
 // 不拦的话搜「蜘蛛侠」会返回名侦探柯南。宁可返回空，也不能返回错条目。
 function isRelevant(title, keyword) {
-  const t = String(title || "").replace(/\s+/g, "").toLowerCase();
-  const k = String(keyword || "").replace(/\s+/g, "").toLowerCase();
+  const t = normTitle(title);
+  const k = normTitle(keyword);
   if (!t || !k) return false;
   if (t.includes(k) || k.includes(t)) return true;
   // 取 min(4, 关键词长度) 个连续字符作为匹配单元。
@@ -454,8 +454,18 @@ function mapType(typeName, typeCode) {
 
 // 片名 → ss 号：查 bili-map.js
 // 先精确匹配，再按「关键词包含表项」取最长，这样带画质/组名后缀的文件名也能对上
+// 归一化：去空白 + 去标点。
+// 客户端传过来的关键词经常把冒号、括号、点号剥掉
+// （「蜘蛛侠：崭新之日」→「蜘蛛侠崭新之日」），不去标点会漏命中映射表。
+function normTitle(x) {
+  return String(x || "")
+    .replace(/\s+/g, "")
+    .replace(/[：:·・\-—–_.,，。、!！?？()（）\[\]【】《》"'“”‘’~～]/g, "")
+    .toLowerCase();
+}
+
 function lookupMap(keyword) {
-  const norm = (x) => String(x || "").replace(/\s+/g, "").toLowerCase();
+  const norm = normTitle;
   const k = norm(keyword);
   if (!k) return null;
   for (const [name, target] of Object.entries(SEASON_MAP)) {
