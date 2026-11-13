@@ -579,13 +579,21 @@ async function getSeasonEpisodes(seasonId, byEpId = false) {
   }
 
   const seen = new Set();
-  const eps = [];
+  let eps = [];
   for (const e of raw) {
     const key = String(e.id);
     if (seen.has(key)) continue;
     seen.add(key);
     eps.push(e);
   }
+
+  // B 站会把「独家物料」「预告」「花絮」这类短片直接塞进 result.episodes，
+  // section_type 仍然是 0，靠字段区分不了，只能看标题。
+  // 电影《蜘蛛侠：崭新之日》的 episodes 是：原版(145min) / 中文版(145min) / 独家物料(3min)。
+  // 全被识别成周边时保留原样，避免把整季都是短片的作品清空。
+  const EXTRA_RE = /物料|花絮|预告|特辑|彩蛋|幕后|访谈|混剪|制作特辑|reaction/i;
+  const core = eps.filter((e) => !EXTRA_RE.test(String(e.title || "")));
+  if (core.length > 0) eps = core;
 
   return {
     seasonId: String(r.season_id || seasonId),
