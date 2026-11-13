@@ -385,8 +385,10 @@ function isRelevant(title, keyword) {
   const k = String(keyword || "").replace(/\s+/g, "").toLowerCase();
   if (!t || !k) return false;
   if (t.includes(k) || k.includes(t)) return true;
-  // 取 min(3, 关键词长度) 个连续字符作为匹配单元
-  const need = Math.min(3, k.length);
+  // 取 min(4, 关键词长度) 个连续字符作为匹配单元。
+  // 3 字会撞车：搜「不存在的片子xyz」时，PGC 回落列表里的
+  // 「唤醒石头里存在的生命」因为含「存在的」被判为相关。
+  const need = Math.min(4, k.length);
   if (need < 2) return false;
   for (let i = 0; i + need <= k.length; i++) {
     if (t.includes(k.slice(i, i + need))) return true;
@@ -427,12 +429,15 @@ async function searchAll(keyword) {
 
   // 入口污染过滤：只保留标题与关键词相关的条目
   const relevant = results.filter((r) => isRelevant(r.title, keyword));
-  // web 入口命中优先（正规搜索接口，排序最准）
-  relevant.sort((a, b) => {
-    const rank = (x) => (x.from.includes("web") ? 0 : x.from.includes("app") ? 1 : 2);
-    return rank(a) - rank(b);
-  });
-  return relevant;
+
+  // 只认真搜索入口的结果。
+  // pgc-index / app / pgc 这三个在关键词不命中时会把「热门列表」当结果返回，
+  // 属于污染源：搜「蜘蛛侠」给「名侦探柯南」，搜不存在的片子给「唤醒石头里存在的生命」。
+  // 没有真搜索入口命中时返回空数组，让调用方知道「没搜到」，而不是给一条错条目。
+  const TRUSTED = /web-|old-ft|all-v2|app-all|html/;
+  const trusted = relevant.filter((r) => TRUSTED.test(r.from));
+  if (trusted.length === 0) return [];
+  return trusted;
 }
 
 // B 站 type_name → danmaku API 的 type 取值（客户端按这个显示图标）
@@ -452,6 +457,7 @@ function lookupMap(keyword) {
   for (const [name, target] of Object.entries(SEASON_MAP)) {
     if (norm(name) === k) return target;
   }
+  if (k.length < 2) return null;
   let best = null;
   for (const [name, target] of Object.entries(SEASON_MAP)) {
     const n = norm(name);
