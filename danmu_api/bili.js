@@ -309,17 +309,8 @@ async function viaAltSearch(keyword) {
     }));
   });
 
-  // 搜索建议：结构化返回，可能带 season_id
-  tasks.push(async () => {
-    const { json } = await bjson(
-      `https://s.search.bilibili.com/main/suggest?term=${encodeURIComponent(keyword)}&main_ver=v1`
-    );
-    const tag = ((json && json.result) || {}).tag || [];
-    return tag.filter((t) => t.spid || t.season_id).map((t) => ({
-      seasonId: String(t.spid || t.season_id), title: stripEm(t.value || t.name), typeName: "",
-      epSize: 0, cover: "", from: "suggest",
-    }));
-  });
+  // 注意：s.search.bilibili.com/main/suggest 返回的 spid 是「搜索建议项编号」，
+  // 不是 season_id，拿它当季号会拼出 animeId=5 这种无效条目。这里不作为季来源。
 
   const r = await Promise.allSettled(tasks.map((f) => f()));
   for (const x of r) if (x.status === "fulfilled") push(x.value);
@@ -553,6 +544,9 @@ const PROBE_ALLOW = [
   "api.pleasfun.com",
   "search.youku.com",
   "mesh.if.iqiyi.com",
+  "www.bilibili.com",
+  "m.bilibili.com",
+  "search.bilibili.com",
 ];
 async function handleProbe(res, target) {
   let u;
@@ -645,6 +639,45 @@ async function handleProbe2(res, keyword) {
   return send(res, 200, { keyword, entries: out, raw });
 }
 
+// HTML 搜索页诊断：确认页面是否真的含 season_id，还是被拦成空壳/验证页
+async function handleProbe3(res, keyword) {
+  const out = {};
+  const cookie = process.env.BILIBILI_COOKIE || "";
+  const headers = { Accept: "text/html,application/xhtml+xml" };
+  if (cookie) {
+    const keep = cookie.split(";").map((x) => x.trim())
+      .filter((x) => /^(SESSDATA|bili_jct|DedeUserID|buvid3|buvid4)=/.test(x));
+    if (keep.length) headers.Cookie = keep.join("; ");
+  }
+  const targets = [
+    `https://search.bilibili.com/all?keyword=${encodeURIComponent(keyword)}`,
+    `https://search.bilibili.com/media?keyword=${encodeURIComponent(keyword)}`,
+    `https://m.bilibili.com/search?keyword=${encodeURIComponent(keyword)}`,
+    `https://www.bilibili.com/bangumi/play/ss218526`,
+  ];
+  for (const u of targets) {
+    const t0 = Date.now();
+    try {
+      const { buf, status } = await bfetch(u, { headers, timeout: 12000 });
+      const html = buf.toString("utf8");
+      out[u] = {
+        status,
+        ms: Date.now() - t0,
+        bytes: html.length,
+        seasonIdHits: (html.match(/season_id/g) || []).length,
+        ssHits: (html.match(/\/bangumi\/play\/ss\d+/g) || []).length,
+        mdHits: (html.match(/\/bangumi\/media\/md\d+/g) || []).length,
+        hasInitialState: html.includes("__INITIAL_STATE__"),
+        hasVerify: /验证|verify|captcha|安全中心/i.test(html.slice(0, 3000)),
+        head: html.slice(0, 240).replace(/\s+/g, " "),
+      };
+    } catch (e) {
+      out[u] = { error: (e && e.message) || String(e) };
+    }
+  }
+  return send(res, 200, { keyword, out });
+}
+
 export default async function handler(req, res) {
   const rawUrl = req.url || "/";
   const qi = rawUrl.indexOf("?");
@@ -658,6 +691,9 @@ export default async function handler(req, res) {
   }
   if (path === "/bili/_probe2" || path === "/_probe2") {
     return handleProbe2(res, sp.get("keyword") || "");
+  }
+  if (path === "/bili/_probe3" || path === "/_probe3") {
+    return handleProbe3(res, sp.get("keyword") || "");
   }
 
   // 剥前缀
