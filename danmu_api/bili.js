@@ -441,10 +441,14 @@ async function searchAll(keyword) {
 }
 
 // B 站 type_name → danmaku API 的 type 取值（客户端按这个显示图标）
-function mapType(typeName) {
+// B 站 PGC 的 season_type：1 番剧 / 2 电影 / 3 纪录片 / 4 国创 / 5 电视剧 / 7 综艺
+// type_name 字段经常是空串，所以数字码优先
+function mapType(typeName, typeCode) {
+  const c = Number(typeCode);
+  if (c === 2 || c === 3) return "movie";
+  if (c === 1 || c === 4 || c === 5 || c === 7) return "tvseries";
   const t = String(typeName || "");
   if (/电影|纪录片|纪实/.test(t)) return "movie";
-  if (/电视剧|番剧|国创|动画|综艺|影视/.test(t)) return "tvseries";
   return "tvseries";
 }
 
@@ -483,7 +487,7 @@ function toAnime(d) {
   return {
     animeId: Number(d.seasonId) || 0,
     animeTitle: `${d.title}【${d.typeName || "B站"}】from bili`,
-    type: mapType(d.typeName),
+    type: mapType(d.typeName, d.typeCode),
     typeDescription: d.typeName || "",
     episodes: toEpisodes(d),
   };
@@ -599,6 +603,7 @@ async function getSeasonEpisodes(seasonId, byEpId = false) {
     seasonId: String(r.season_id || seasonId),
     title: stripEm(r.title),
     typeName: r.type_name || r.season_type_name || "",
+    typeCode: r.type,
     cover: String(r.cover || "").replace(/^\/\//, "https://"),
     total: Number(r.total) || eps.length,
     episodes: eps.map((e, idx) => ({
@@ -914,7 +919,7 @@ export default async function handler(req, res) {
           bangumi: {
             animeId: Number(d.seasonId) || 0,
             animeTitle: d.title,
-            type: mapType(d.typeName),
+            type: mapType(d.typeName, d.typeCode),
             typeDescription: d.typeName,
             episodes: toEpisodes(d),
           },
