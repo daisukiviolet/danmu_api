@@ -484,22 +484,68 @@ function lookupMap(keyword) {
 }
 
 // 把一季的分集转成 danmaku API 的 episode 结构
+// episodeId 必须是数字：弹弹play 官方 /v2/search/anime 里这个字段是 int64，
+// 客户端模型按 int 解析，给字符串会整条被丢掉（表现就是「共0集」）。
 function toEpisodes(d) {
   return d.episodes.map((e) => ({
-    episodeId: e.epId,
+    seasonId: `season-${d.seasonId}`,
+    episodeId: Number(e.epId) || 0,
     episodeTitle: e.title,
     episodeNumber: String(e.index),
+    airDate: "",
     url: `https://www.bilibili.com/bangumi/play/ep${e.epId}`,
   }));
 }
 
+// 作品级结构。字段必须与官方 /v2/search/anime 逐项对齐：
+// 官方返回里没有 episodes 数组，只有 episodeCount（列表页「共 N 集」读的就是它）。
+// 之前只给 episodes 不给 episodeCount，客户端算出来就是 0 集。
 function toAnime(d) {
+  const eps = toEpisodes(d);
   return {
     animeId: Number(d.seasonId) || 0,
+    bangumiId: `ss${d.seasonId}`,
     animeTitle: `${d.title}【${d.typeName || "B站"}】from bili`,
     type: mapType(d.typeName, d.typeCode),
     typeDescription: d.typeName || "",
-    episodes: toEpisodes(d),
+    imageUrl: d.cover || "",
+    startDate: "",
+    episodeCount: eps.length,
+    rating: 0,
+    isFavorited: false,
+    source: "bili",
+    aliases: [],
+    seasons: [
+      {
+        id: `season-${d.seasonId}`,
+        airDate: "",
+        name: "Season 1",
+        episodeCount: eps.length,
+      },
+    ],
+    episodes: eps,
+  };
+}
+
+// 只拿到作品、还没查分集时用的占位结构。
+// episodeCount 用搜索入口给的 epSize（B 站 ep_size 就是总集数），
+// 没有 epSize 时给 0，客户端会再请求 /v2/bangumi/{animeId} 补详情。
+function toAnimeStub(it) {
+  return {
+    animeId: Number(it.seasonId) || 0,
+    bangumiId: `ss${it.seasonId}`,
+    animeTitle: `${it.title}【${it.typeName || "B站"}】from bili`,
+    type: mapType(it.typeName),
+    typeDescription: it.typeName || "",
+    imageUrl: it.cover || "",
+    startDate: "",
+    episodeCount: Number(it.epSize) || 0,
+    rating: 0,
+    isFavorited: false,
+    source: "bili",
+    aliases: [],
+    seasons: [],
+    episodes: [],
   };
 }
 
@@ -549,14 +595,7 @@ async function buildAnimes(keyword, { epNo = "", detailTop = 2 } = {}) {
     if (d && d.episodes.length) {
       animes.push(toAnime(d));
     } else {
-      // 没拉详情时给空 episodes，客户端会再请求 /v2/bangumi/{animeId}
-      animes.push({
-        animeId: Number(it.seasonId) || 0,
-        animeTitle: `${it.title}【${it.typeName || "B站"}】from bili`,
-        type: mapType(it.typeName),
-        typeDescription: it.typeName || "",
-        episodes: [],
-      });
+      animes.push(toAnimeStub(it));
     }
   }
   return animes;
@@ -629,6 +668,42 @@ async function getSeasonEpisodes(seasonId, byEpId = false) {
       duration: Number(e.duration) || 0,
     })),
   };
+}
+
+// ---------- 详情入口的 id 归一化 ----------
+// 客户端点搜索结果时，回传给 /v2/bangumi/{id} 的 id 有四种形态：
+//   218526          season_id（search 里我们给的 animeId）
+//   ss218526        bangumiId（search 里我们给的 bangumiId）
+//   season-218526   seasons[].id
+//   7573614         episodeId（有的客户端直接拿第一集的 episodeId 当详情入口）
+// 只认纯 season_id 的话，后三种全部 404「Anime not found」。
+// 逐个试：先 season_id，再剥前缀，最后按 ep_id 反查。
+async function resolveSeason(idRaw) {
+  const s = String(idRaw || "").trim();
+  if (!s) return null;
+
+  const digits = s.replace(/\D/g, "");
+  const tries = [];
+  // 纯数字优先按 season_id（正常路径，一次就中）
+  if (/^\d+$/.test(s)) tries.push([s, false]);
+  // 带前缀（ss218526 / season-218526 / bili_218526）先剥掉，再按 season_id
+  if (digits && !/^\d+$/.test(s)) tries.push([digits, false]);
+  // 最后当 ep_id 反查，覆盖客户端传 episodeId 的情况
+  if (digits) tries.push([digits, true]);
+
+  const seen = new Set();
+  for (const [id, byEp] of tries) {
+    const key = (byEp ? "ep:" : "ss:") + id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      const d = await getSeasonEpisodes(id, byEp);
+      if (d && d.episodes.length) return d;
+    } catch {
+      // 换下一种形态，不中断
+    }
+  }
+  return null;
 }
 
 // ---------- 弹幕：转发给 worker 的 comment?url=（该路径已验证可达） ----------
@@ -1029,11 +1104,17 @@ export default async function handler(req, res) {
 
   // ---- 番剧详情 ----
   if (path.startsWith("/v2/bangumi/")) {
-    const id = decodeURIComponent(path.slice("/v2/bangumi/".length));
+    const raw = decodeURIComponent(path.slice("/v2/bangumi/".length));
     try {
-      const d = await getSeasonEpisodes(id);
+      const d = await resolveSeason(raw);
       if (!d) {
-        return send(res, 404, { errorCode: 404, success: false, errorMessage: "Anime not found", bangumi: null });
+        // 把原始 id 带出去，客户端报错时能直接看到是哪种形态没兜住
+        return send(res, 404, {
+          errorCode: 404,
+          success: false,
+          errorMessage: "Anime not found: " + raw,
+          bangumi: null,
+        });
       }
       return send(
         res,
@@ -1044,9 +1125,27 @@ export default async function handler(req, res) {
           errorMessage: "",
           bangumi: {
             animeId: Number(d.seasonId) || 0,
+            bangumiId: `ss${d.seasonId}`,
             animeTitle: d.title,
+            imageUrl: d.cover || "",
+            isOnAir: true,
+            airDay: 0,
+            isFavorited: false,
+            rating: 0,
             type: mapType(d.typeName, d.typeCode),
             typeDescription: d.typeName,
+            // 与 search/anime 保持一致的字段集：客户端两处都读 episodeCount
+            episodeCount: d.episodes.length,
+            source: "bili",
+            aliases: [],
+            seasons: [
+              {
+                id: `season-${d.seasonId}`,
+                airDate: "",
+                name: "Season 1",
+                episodeCount: d.episodes.length,
+              },
+            ],
             episodes: toEpisodes(d),
           },
         },
