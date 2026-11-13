@@ -781,6 +781,119 @@ async function handleProbe2(res, keyword) {
   return send(res, 200, { keyword, entries: out, raw });
 }
 
+// ---------- 弹幕条数诊断 ----------
+// 目的：区分「B 站只下发这么多」和「我们的链路丢了一半」。
+// 直接数 seg.so 的 protobuf 条目，不经过任何去重逻辑。
+function pbVarint(b, i) {
+  let r = 0, s = 0;
+  while (i < b.length) {
+    const x = b[i++];
+    r |= (x & 0x7f) << s;
+    s += 7;
+    if (!(x & 0x80)) return [r, i];
+  }
+  return [r, i];
+}
+
+// 平铺解析 protobuf 顶层字段，返回 [fieldNo, value] 列表
+function pbFields(buf) {
+  const out = [];
+  let i = 0;
+  while (i < buf.length) {
+    let f, w;
+    [f, i] = pbVarint(buf, i);
+    if (f === undefined) break;
+    w = f & 7;
+    f = f >>> 3;
+    if (w === 2) {
+      let ln;
+      [ln, i] = pbVarint(buf, i);
+      out.push([f, buf.subarray(i, i + ln)]);
+      i += ln;
+    } else if (w === 0) {
+      let v;
+      [v, i] = pbVarint(buf, i);
+      out.push([f, v]);
+    } else if (w === 5) {
+      i += 4;
+    } else if (w === 1) {
+      i += 8;
+    } else {
+      break;
+    }
+  }
+  return out;
+}
+
+async function handleDmStat(res, epId) {
+  const t0 = Date.now();
+  let cid = "";
+  let title = "";
+  try {
+    const d = await getSeasonEpisodes(epId, true);
+    if (d && d.episodes.length) {
+      const ep = d.episodes.find((e) => e.epId === String(epId)) || d.episodes[0];
+      cid = ep.cid;
+      title = `${d.title} ${ep.title}`;
+    }
+  } catch {}
+  if (!cid) return send(res, 200, { success: false, errorMessage: "找不到 cid，检查 ep 号" });
+
+  const cookie = process.env.BILIBILI_COOKIE || "";
+  const keep = cookie
+    .split(";")
+    .map((x) => x.trim())
+    .filter((x) => /^(SESSDATA|bili_jct|DedeUserID|buvid3|buvid4)=/.test(x))
+    .join("; ");
+  const headers = { Referer: "https://www.bilibili.com/bangumi/" };
+  if (keep) headers.Cookie = keep;
+
+  // 官方标注的总数
+  let official = null;
+  try {
+    const { buf } = await bfetch(`https://api.bilibili.com/x/v2/dm/web/view?type=1&oid=${cid}`, { headers, timeout: 8000 });
+    const f8 = pbFields(buf).find(([f]) => f === 8);
+    if (f8) official = f8[1];
+  } catch {}
+
+  // 逐段数条目，8 并发分批，避免触发风控
+  const per = [];
+  for (let start = 1; start <= 33; start += 8) {
+    const batch = [];
+    for (let k = start; k < start + 8 && k <= 33; k++) batch.push(k);
+    const rs = await Promise.all(
+      batch.map(async (idx) => {
+        try {
+          const { buf } = await bfetch(
+            `https://api.bilibili.com/x/v2/dm/web/seg.so?type=1&oid=${cid}&segment_index=${idx}`,
+            { headers, timeout: 8000 }
+          );
+          return [idx, pbFields(buf).filter(([f]) => f === 1).length];
+        } catch (e) {
+          return [idx, -1];
+        }
+      })
+    );
+    for (const [idx, n] of rs) per.push([idx, n]);
+    if (per.length && per.slice(-batch.length).every(([, n]) => n === 0)) break;
+  }
+
+  const nonzero = per.filter(([, n]) => n > 0);
+  const total = nonzero.reduce((a, [, n]) => a + n, 0);
+  return send(res, 200, {
+    success: true,
+    title,
+    cid,
+    epId: String(epId),
+    hasCookie: !!keep,
+    officialCount: official,
+    segmentsFetched: nonzero.length,
+    rawTotal: total,
+    perSegment: nonzero.map(([i2, n]) => `${i2}:${n}`).join(" "),
+    ms: Date.now() - t0,
+  });
+}
+
 // HTML 搜索页诊断：确认页面是否真的含 season_id，还是被拦成空壳/验证页
 async function handleProbe3(res, keyword) {
   const out = {};
@@ -850,6 +963,9 @@ export default async function handler(req, res) {
   }
   if (path === "/bili/_probe3" || path === "/_probe3") {
     return handleProbe3(res, sp.get("keyword") || "");
+  }
+  if (path === "/bili/_dmstat" || path === "/_dmstat") {
+    return handleDmStat(res, sp.get("ep") || "");
   }
 
   // 剥前缀
