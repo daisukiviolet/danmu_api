@@ -567,17 +567,20 @@ async function getSeasonEpisodes(seasonId, byEpId = false) {
   const r = (json && json.result) || null;
   if (!r) return null;
 
-  const main = Array.isArray(r.episodes) ? r.episodes : [];
-  const sections = [];
-  for (const s of r.section || []) {
-    for (const e of s.episodes || []) sections.push(e);
+  // 正片只在 result.episodes 里。
+  // result.section[] 放的是花絮、PV、预告、独家物料这些周边内容，
+  // 合并进来会把一部电影算成 12 集（原版 + 中配 + 10 个 PV/花絮）。
+  // 只有正片列表为空时才拿 section 兜底，因为少数剧把正片挂在 section 里。
+  let raw = (Array.isArray(r.episodes) ? r.episodes : []).filter((e) => e && e.id);
+  if (raw.length === 0) {
+    for (const sec of r.section || []) {
+      for (const e of sec.episodes || []) if (e && e.id) raw.push(e);
+    }
   }
-  const all = [...main, ...sections].filter((e) => e && e.id);
 
-  // 去重（正片与花絮可能重叠）
   const seen = new Set();
   const eps = [];
-  for (const e of all) {
+  for (const e of raw) {
     const key = String(e.id);
     if (seen.has(key)) continue;
     seen.add(key);
