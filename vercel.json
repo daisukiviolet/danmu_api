@@ -12,6 +12,10 @@
     {
       "src": "danmu_api/bili.js",
       "use": "@vercel/node"
+    },
+    {
+      "src": "danmu_api/bili-fix.js",
+      "use": "@vercel/node"
     }
   ],
   "regions": [
@@ -32,11 +36,11 @@
     },
     {
       "src": "/bili/(.*)",
-      "dest": "/danmu_api/bili.js"
+      "dest": "/danmu_api/bili-fix.js"
     },
     {
       "src": "/bili",
-      "dest": "/danmu_api/bili.js"
+      "dest": "/danmu_api/bili-fix.js"
     },
     {
       "src": "/api/(.*)",
