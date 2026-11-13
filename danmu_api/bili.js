@@ -133,11 +133,23 @@ function stripEm(s) {
     .trim();
 }
 
-// 入口 1：web 搜索 media_ft / media_bangumi（已知对机房 IP 常返空）
-async function viaWebSearch(keyword, searchType) {
+// 入口 1：web 搜索 media_ft / media_bangumi
+// 对未登录的机房 IP 会返回 code:0 + numResults:0 的空结果（静默风控）。
+// 带上真实登录 Cookie 后可能放行，所以这里把 BILIBILI_COOKIE 一起发出去。
+async function viaWebSearch(keyword, searchType, useCookie = false) {
   const qs = await signedWbi({ keyword, search_type: searchType });
   if (!qs) return [];
-  const { json } = await bjson(`https://api.bilibili.com/x/web-interface/wbi/search/type?${qs}`);
+  const headers = {};
+  const cookie = process.env.BILIBILI_COOKIE || "";
+  // 只取其中的 SESSDATA / bili_jct / DedeUserID / buvid3，避免把无关 cookie 带上去触发校验
+  if (useCookie && cookie) {
+    const keep = cookie
+      .split(";")
+      .map((s) => s.trim())
+      .filter((s) => /^(SESSDATA|bili_jct|DedeUserID|buvid3|buvid4)=/.test(s));
+    if (keep.length) headers.Cookie = keep.join("; ");
+  }
+  const { json } = await bjson(`https://api.bilibili.com/x/web-interface/wbi/search/type?${qs}`, { headers });
   const res = (json && json.data && json.data.result) || [];
   return res
     .filter((r) => r.season_id)
@@ -149,6 +161,100 @@ async function viaWebSearch(keyword, searchType) {
       cover: String(r.cover || "").replace(/^\/\//, "https://"),
       from: "web-" + searchType,
     }));
+}
+
+// 入口 1b：网页版搜索页 HTML。搜索 API 走的是接口风控，HTML 搜索页是另一套网关，
+// 页面里带 SSR 数据，能直接抠出 season_id。
+async function viaHtmlSearch(keyword) {
+  const out = [];
+  const targets = [
+    `https://search.bilibili.com/all?keyword=${encodeURIComponent(keyword)}`,
+    `https://m.bilibili.com/search?keyword=${encodeURIComponent(keyword)}`,
+    `https://search.bilibili.com/media?keyword=${encodeURIComponent(keyword)}`,
+  ];
+  const cookie = process.env.BILIBILI_COOKIE || "";
+  const headers = { Accept: "text/html,application/xhtml+xml" };
+  if (cookie) {
+    const keep = cookie
+      .split(";")
+      .map((s) => s.trim())
+      .filter((s) => /^(SESSDATA|bili_jct|DedeUserID|buvid3|buvid4)=/.test(s));
+    if (keep.length) headers.Cookie = keep.join("; ");
+  }
+
+  const seen = new Set();
+  for (const u of targets) {
+    let html = "";
+    try {
+      const { buf, status } = await bfetch(u, { headers, timeout: 10000 });
+      if (status !== 200) continue;
+      html = buf.toString("utf8");
+    } catch {
+      continue;
+    }
+    if (!html || html.length < 500) continue;
+
+    // 1) SSR 数据里成对出现的 season_id + title
+    const re = /"season_id":(\d{2,8})[^}]{0,600}?"title":"([^"]{1,80})"/g;
+    let m;
+    while ((m = re.exec(html))) {
+      const sid = m[1];
+      if (seen.has(sid)) continue;
+      seen.add(sid);
+      let title = m[2];
+      try {
+        title = JSON.parse('"' + title + '"');
+      } catch {}
+      out.push({
+        seasonId: sid,
+        title: stripEm(title),
+        typeName: "",
+        epSize: 0,
+        cover: "",
+        from: "html",
+      });
+    }
+    // 2) 兜底：正文里出现的 md/ss 链接
+    if (out.length === 0) {
+      const re2 = /(?:ss|\/bangumi\/media\/md)(\d{3,8})/g;
+      while ((m = re2.exec(html))) {
+        const sid = m[1];
+        if (seen.has(sid)) continue;
+        seen.add(sid);
+        out.push({ seasonId: sid, title: keyword, typeName: "", epSize: 0, cover: "", from: "html-link" });
+      }
+    }
+  }
+  return out;
+}
+
+// 入口 1c：PGC 索引接口（与 season/search/list 是不同后端）
+async function viaPgcIndex(keyword) {
+  const out = [];
+  for (const st of [2, 1, 5, 4, 3]) {
+    const u = `https://api.bilibili.com/pgc/season/index/result?season_type=${st}&keyword=${encodeURIComponent(
+      keyword
+    )}&page=1&pagesize=20&order=0&st=1&sort=0&type=1&area=&year=&style=&season_version=-1&spoken_language_type=-1`;
+    try {
+      const { json } = await bjson(u);
+      const list =
+        (json && json.data && (json.data.list || json.data.result || json.data.data)) || [];
+      for (const r of list) {
+        if (!r.season_id) continue;
+        out.push({
+          seasonId: String(r.season_id),
+          title: stripEm(r.title),
+          typeName: r.season_type_name || "",
+          epSize: Number(r.total_count || 0) || 0,
+          cover: String(r.cover || "").replace(/^\/\//, "https://"),
+          from: "pgc-index",
+        });
+      }
+    } catch {
+      // 单个 season_type 失败不影响其他
+    }
+  }
+  return out;
 }
 
 // 入口 2：PGC 季库搜索（番剧/影视/纪录片/国创/电视剧）
@@ -242,14 +348,18 @@ async function searchAll(keyword) {
     }
   };
 
-  // 三个入口并行，任一有结果即可用；全部空才是真无结果
-  const [w1, w2, app, pgc] = await Promise.allSettled([
-    viaWebSearch(keyword, "media_ft"),
-    viaWebSearch(keyword, "media_bangumi"),
+  // 所有入口并行，任一有结果即可用；全部空才是真无结果
+  // 排序重要性：web 带 Cookie > html 搜索页 > pgc-index > app（app 会回落热门，必须过滤）
+  const settled = await Promise.allSettled([
+    viaWebSearch(keyword, "media_ft", true),
+    viaWebSearch(keyword, "media_bangumi", true),
+    viaHtmlSearch(keyword),
+    viaPgcIndex(keyword),
     viaAppSearch(keyword),
     viaPgcSearch(keyword),
   ]);
-  for (const r of [w1, w2, app, pgc]) if (r.status === "fulfilled") push(r.value);
+  // 先接 web/html/pgc-index，最后接 app/pgc 这类会串味的入口
+  for (const r of settled) if (r.status === "fulfilled") push(r.value);
 
   // 入口污染过滤：只保留标题与关键词相关的条目
   const relevant = results.filter((r) => isRelevant(r.title, keyword));
@@ -423,17 +533,17 @@ async function handleProbe2(res, keyword) {
   out._mixinKey = mixin ? mixin.slice(0, 8) + "…(len " + mixin.length + ")" : "FAILED";
 
   await t("web_media_ft", () => viaWebSearch(keyword, "media_ft"));
+  await t("web_media_ft_cookie", () => viaWebSearch(keyword, "media_ft", true));
   await t("web_media_bangumi", () => viaWebSearch(keyword, "media_bangumi"));
+  await t("web_bangumi_cookie", () => viaWebSearch(keyword, "media_bangumi", true));
+  await t("html", () => viaHtmlSearch(keyword));
+  await t("pgc_index", () => viaPgcIndex(keyword));
   await t("app", () => viaAppSearch(keyword));
   await t("pgc", () => viaPgcSearch(keyword));
+  out._hasCookie = !!(process.env.BILIBILI_COOKIE && process.env.BILIBILI_COOKIE.length > 20);
 
   // 原始返回，不经解析，用来判断接口本身给的是不是空
   const raw = {};
-  const qs = mixin
-    ? Object.keys({ keyword, search_type: "media_ft", wts: Math.floor(Date.now() / 1000) })
-        .sort()
-        .join("|")
-    : "";
   try {
     const s = await signedWbi({ keyword, search_type: "media_ft" });
     const { status, buf } = await bfetch(`https://api.bilibili.com/x/web-interface/wbi/search/type?${s}`);
