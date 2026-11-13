@@ -12,6 +12,9 @@
 // package.json 是 type:module，只能用 import，不能用 require
 import crypto from "node:crypto";
 
+// 片名 → season_id 映射表。B 站搜索被封的绕行方案，详见 bili-map.js 注释
+import SEASON_MAP from "./bili-map.js";
+
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -432,6 +435,113 @@ async function searchAll(keyword) {
   return relevant;
 }
 
+// B 站 type_name → danmaku API 的 type 取值（客户端按这个显示图标）
+function mapType(typeName) {
+  const t = String(typeName || "");
+  if (/电影|纪录片|纪实/.test(t)) return "movie";
+  if (/电视剧|番剧|国创|动画|综艺|影视/.test(t)) return "tvseries";
+  return "tvseries";
+}
+
+// 片名 → ss 号：查 bili-map.js
+// 先精确匹配，再按「关键词包含表项」取最长，这样带画质/组名后缀的文件名也能对上
+function lookupMap(keyword) {
+  const norm = (x) => String(x || "").replace(/\s+/g, "").toLowerCase();
+  const k = norm(keyword);
+  if (!k) return null;
+  for (const [name, target] of Object.entries(SEASON_MAP)) {
+    if (norm(name) === k) return target;
+  }
+  let best = null;
+  for (const [name, target] of Object.entries(SEASON_MAP)) {
+    const n = norm(name);
+    if (!n) continue;
+    if (k.includes(n) || n.includes(k)) {
+      if (!best || n.length > best.len) best = { target, len: n.length };
+    }
+  }
+  return best ? best.target : null;
+}
+
+// 把一季的分集转成 danmaku API 的 episode 结构
+function toEpisodes(d) {
+  return d.episodes.map((e) => ({
+    episodeId: e.epId,
+    episodeTitle: e.title,
+    episodeNumber: String(e.index),
+    url: `https://www.bilibili.com/bangumi/play/ep${e.epId}`,
+  }));
+}
+
+function toAnime(d) {
+  return {
+    animeId: Number(d.seasonId) || 0,
+    animeTitle: `${d.title}【${d.typeName || "B站"}】from bili`,
+    type: mapType(d.typeName),
+    typeDescription: d.typeName || "",
+    episodes: toEpisodes(d),
+  };
+}
+
+// 统一的 animes 构建：直通 → 映射表 → 关键词搜索
+// detailTop: 只对前 N 个候选拉分集详情，控制一次请求的耗时（每个候选约 0.5s）
+async function buildAnimes(keyword, { epNo = "", detailTop = 2 } = {}) {
+  // ① 粘贴了链接 / ss / ep
+  const direct = parseDirectTarget(keyword);
+  if (direct) {
+    try {
+      const d = await getSeasonEpisodes(direct.id, direct.kind === "ep");
+      if (d && d.episodes.length) return [toAnime(d)];
+    } catch {
+      // 落到下一步
+    }
+  }
+
+  // ② 片名映射表
+  const mapped = lookupMap(keyword);
+  if (mapped) {
+    const t = parseDirectTarget(mapped) || { kind: "ss", id: String(mapped).replace(/\D/g, "") };
+    if (t.id) {
+      try {
+        const d = await getSeasonEpisodes(t.id, t.kind === "ep");
+        if (d && d.episodes.length) return [toAnime(d)];
+      } catch {
+        // 落到下一步
+      }
+    }
+  }
+
+  // ③ 关键词搜索（机房 IP 下多半为空，返回空数组而不是报错）
+  let list = await searchAll(keyword);
+  if (list.length === 0 && keyword.length > 12) list = await searchAll(keyword.slice(0, 12));
+
+  const animes = [];
+  for (let i = 0; i < list.length && i < 5; i++) {
+    const it = list[i];
+    let d = null;
+    if (i < detailTop) {
+      try {
+        d = await getSeasonEpisodes(it.seasonId);
+      } catch {
+        d = null;
+      }
+    }
+    if (d && d.episodes.length) {
+      animes.push(toAnime(d));
+    } else {
+      // 没拉详情时给空 episodes，客户端会再请求 /v2/bangumi/{animeId}
+      animes.push({
+        animeId: Number(it.seasonId) || 0,
+        animeTitle: `${it.title}【${it.typeName || "B站"}】from bili`,
+        type: mapType(it.typeName),
+        typeDescription: it.typeName || "",
+        episodes: [],
+      });
+    }
+  }
+  return animes;
+}
+
 // ---------- 直通：粘贴 B 站链接 / ss号 / ep号 直接命中 ----------
 // 搜索接口被机房 IP 风控时，这是唯一稳定可用的入口。
 // 用户在播放器搜索框里贴 https://www.bilibili.com/bangumi/play/ss218526 即可。
@@ -719,97 +829,46 @@ export default async function handler(req, res) {
   if (path === "/" || path === "") {
     return send(res, 200, {
       service: "danmu_api bili mount",
-      note: "B 站独立源：搜索绕过 media_ft 风控，弹幕走官方接口",
-      selfTest: "/bili/api/v2/search/episodes?anime=蜘蛛侠",
+      note: "B 站独立源。机房 IP 的搜索接口被 B 站服务端置零，所以支持直接粘贴 ss/ep 号或链接；片名可用 bili-map.js 预先登记",
+      selfTest: "/bili/api/v2/search/anime?keyword=ss218526",
       probe: "/bili/_probe?u=<urlencoded bilibili api url>",
     });
   }
 
-  // ---- 搜索 ----
-  if (path === "/v2/search/episodes") {
-    const anime = (sp.get("anime") || "").trim();
-    const epNo = sp.get("episode");
-    if (!anime) return send(res, 200, { success: false, errorCode: 400, errorMessage: "anime required", animes: [] });
-
-    // 先判是不是「贴了 B 站链接/ID」——这类直接命中，不走搜索引擎
-    const direct = parseDirectTarget(anime);
-    if (direct) {
-      try {
-        const d = await getSeasonEpisodes(direct.id, direct.kind === "ep");
-        if (d && d.episodes.length) {
-          const eps = d.episodes.map((e) => ({
-            episodeId: e.epId,
-            episodeTitle: e.title,
-            episodeNumber: String(e.index),
-            url: `https://www.bilibili.com/bangumi/play/ep${e.epId}`,
-          }));
-          return send(res, 200, {
-            success: true,
-            errorCode: 0,
-            errorMessage: "",
-            animes: [
-              {
-                animeId: Number(d.seasonId) || 0,
-                animeTitle: `${d.title}【${d.typeName || "B站"}】from bili`,
-                type: "bili",
-                typeDescription: d.typeName || "",
-                episodes: eps,
-              },
-            ],
-          }, ttlFor("/v2/search/"));
-        }
-      } catch {
-        // 落到关键词搜索
-      }
+  // ---- 搜索：anime 列表 ----
+  // 客户端（Hills / 各类 danmaku API 播放器）搜索第一步走这里，
+  // 之前只实现了 search/episodes，搜索框一按就 404。
+  if (path === "/v2/search/anime" || path === "/v2/search/episodes") {
+    const isAnime = path === "/v2/search/anime";
+    const keyword = ((isAnime ? sp.get("keyword") : sp.get("anime")) || "").trim();
+    const epNo = isAnime ? "" : sp.get("episode") || "";
+    if (!keyword) {
+      return send(res, 200, {
+        success: false,
+        errorCode: 400,
+        errorMessage: isAnime ? "keyword required" : "anime required",
+        animes: [],
+      });
     }
-
     try {
-      let list = await searchAll(anime);
-      // 关键词太长（文件名整串）时退回前 12 字再搜一次
-      if (list.length === 0 && anime.length > 12) {
-        list = await searchAll(anime.slice(0, 12));
-      }
-      const animes = [];
-      // 最多取 5 个候选的分集：候选越多，拉详情的请求越多，容易把函数拖过 10s
-      for (const it of list.slice(0, 5)) {
-        let detail = null;
-        try {
-          detail = await getSeasonEpisodes(it.seasonId);
-        } catch {
-          detail = null;
+      // search/anime 只要作品级信息，最多拉 1 个详情；search/episodes 要集列表，拉 2 个
+      const animes = await buildAnimes(keyword, { epNo, detailTop: isAnime ? 1 : 2 });
+      // episode 参数存在时，把每条里的集列表收窄到那一集
+      if (epNo) {
+        for (const a of animes) {
+          if (!a.episodes.length) continue;
+          const hit = a.episodes.filter(
+            (e) => String(e.episodeNumber) === String(epNo) || String(e.episodeTitle).includes(String(epNo))
+          );
+          if (hit.length) a.episodes = hit;
         }
-        if (!detail || detail.episodes.length === 0) {
-          animes.push({
-            animeId: Number(it.seasonId) || 0,
-            animeTitle: `${it.title}【${it.typeName || "B站"}】from bili`,
-            type: "bili",
-            typeDescription: it.typeName || "",
-            episodes: [],
-          });
-          continue;
-        }
-        const eps = detail.episodes
-          .filter((e) => (epNo ? String(e.index) === String(epNo) || e.title.includes(String(epNo)) : true))
-          .map((e) => ({
-            episodeId: e.epId,
-            episodeTitle: e.title,
-            episodeNumber: String(e.index),
-            url: `https://www.bilibili.com/bangumi/play/ep${e.epId}`,
-          }));
-        animes.push({
-          animeId: Number(it.seasonId) || 0,
-          animeTitle: `${detail.title || it.title}【${detail.typeName || it.typeName || "B站"}】from bili`,
-          type: "bili",
-          typeDescription: detail.typeName || it.typeName || "",
-          episodes: eps.length ? eps : detail.episodes.map((e) => ({
-            episodeId: e.epId,
-            episodeTitle: e.title,
-            episodeNumber: String(e.index),
-            url: `https://www.bilibili.com/bangumi/play/ep${e.epId}`,
-          })),
-        });
       }
-      return send(res, 200, { success: true, errorCode: 0, errorMessage: "", animes }, ttlFor("/v2/search/"));
+      return send(
+        res,
+        200,
+        { success: true, errorCode: 0, errorMessage: "", animes },
+        ttlFor("/v2/search/")
+      );
     } catch (e) {
       return send(res, 502, {
         success: false,
@@ -838,14 +897,9 @@ export default async function handler(req, res) {
           bangumi: {
             animeId: Number(d.seasonId) || 0,
             animeTitle: d.title,
-            type: "bili",
+            type: mapType(d.typeName),
             typeDescription: d.typeName,
-            episodes: d.episodes.map((e) => ({
-              episodeId: e.epId,
-              episodeTitle: e.title,
-              episodeNumber: String(e.index),
-              url: `https://www.bilibili.com/bangumi/play/ep${e.epId}`,
-            })),
+            episodes: toEpisodes(d),
           },
         },
         ttlFor("/v2/bangumi/")
