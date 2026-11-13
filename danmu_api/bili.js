@@ -653,7 +653,8 @@ async function handleProbe3(res, keyword) {
     `https://search.bilibili.com/all?keyword=${encodeURIComponent(keyword)}`,
     `https://search.bilibili.com/media?keyword=${encodeURIComponent(keyword)}`,
     `https://m.bilibili.com/search?keyword=${encodeURIComponent(keyword)}`,
-    `https://www.bilibili.com/bangumi/play/ss218526`,
+    `https://search.bilibili.com/all?keyword=${encodeURIComponent(keyword)}&t=media`,
+    `https://api.bilibili.com/x/web-interface/search/type?search_type=media_ft&keyword=${encodeURIComponent(keyword)}`,
   ];
   for (const u of targets) {
     const t0 = Date.now();
@@ -670,6 +671,19 @@ async function handleProbe3(res, keyword) {
         hasInitialState: html.includes("__INITIAL_STATE__"),
         hasVerify: /验证|verify|captcha|安全中心/i.test(html.slice(0, 3000)),
         head: html.slice(0, 240).replace(/\s+/g, " "),
+        // 把 season_id / 作品 ID 出现处的上下文摘出来，用来判断 SSR 数据结构
+        contexts: (() => {
+          const arr = [];
+          const re = /season_id|"ssid"|bangumi|media_id/g;
+          let m;
+          let n = 0;
+          while ((m = re.exec(html)) && n < 5) {
+            arr.push(html.slice(Math.max(0, m.index - 120), m.index + 200).replace(/\s+/g, " "));
+            n++;
+          }
+          return arr;
+        })(),
+        titleHits: (html.match(/蜘蛛侠/g) || []).length,
       };
     } catch (e) {
       out[u] = { error: (e && e.message) || String(e) };
