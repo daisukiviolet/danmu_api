@@ -8,6 +8,10 @@
     {
       "src": "danmu_api/ddp.js",
       "use": "@vercel/node"
+    },
+    {
+      "src": "danmu_api/bili.js",
+      "use": "@vercel/node"
     }
   ],
   "regions": [
@@ -25,6 +29,14 @@
     {
       "src": "/ddp",
       "dest": "/danmu_api/ddp.js"
+    },
+    {
+      "src": "/bili/(.*)",
+      "dest": "/danmu_api/bili.js"
+    },
+    {
+      "src": "/bili",
+      "dest": "/danmu_api/bili.js"
     },
     {
       "src": "/api/(.*)",
