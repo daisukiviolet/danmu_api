@@ -257,6 +257,75 @@ async function viaPgcIndex(keyword) {
   return out;
 }
 
+// 入口 1d：其余未被 media_ft 风控覆盖的搜索通道，一次全试
+async function viaAltSearch(keyword) {
+  const out = [];
+  const push = (arr) => {
+    for (const it of arr) if (it && it.seasonId) out.push(it);
+  };
+  const tasks = [];
+
+  // 老版搜索接口，不带 wbi 签名
+  tasks.push(async () => {
+    const u = `https://api.bilibili.com/x/web-interface/search/type?search_type=media_ft&keyword=${encodeURIComponent(keyword)}`;
+    const { json } = await bjson(u);
+    const res = (json && json.data && json.data.result) || [];
+    return res.filter((r) => r.season_id).map((r) => ({
+      seasonId: String(r.season_id), title: stripEm(r.title), typeName: r.season_type_name || "",
+      epSize: Number(r.ep_size) || 0, cover: "", from: "old-ft",
+    }));
+  });
+
+  // 综合搜索 all/v2
+  tasks.push(async () => {
+    const qs = await signedWbi({ keyword });
+    if (!qs) return [];
+    const { json } = await bjson(`https://api.bilibili.com/x/web-interface/wbi/search/all/v2?${qs}`);
+    const groups = (json && json.data && json.data.result) || [];
+    const res = [];
+    for (const g of groups) for (const it of g.data || []) if (it.season_id) res.push(it);
+    return res.map((r) => ({
+      seasonId: String(r.season_id), title: stripEm(r.title), typeName: r.season_type_name || "",
+      epSize: Number(r.ep_size) || 0, cover: "", from: "all-v2",
+    }));
+  });
+
+  // App 综合搜索（与 type 搜索不同后端）
+  tasks.push(async () => {
+    const qs = signedApp({
+      keyword, build: 7840300, mobi_app: "android", platform: "android",
+      c_locale: "zh_CN", s_locale: "zh_CN",
+    });
+    const { json } = await bjson(`https://app.bilibili.com/x/v2/search?${qs}`);
+    const items = (json && json.data && (json.data.items || json.data.result)) || [];
+    const res = [];
+    for (const it of items) {
+      if (it.season_id) res.push(it);
+      for (const sub of it.data || []) if (sub.season_id) res.push(sub);
+    }
+    return res.map((r) => ({
+      seasonId: String(r.season_id), title: stripEm(r.title), typeName: r.season_type_name || "",
+      epSize: Number(r.ep_size) || 0, cover: "", from: "app-all",
+    }));
+  });
+
+  // 搜索建议：结构化返回，可能带 season_id
+  tasks.push(async () => {
+    const { json } = await bjson(
+      `https://s.search.bilibili.com/main/suggest?term=${encodeURIComponent(keyword)}&main_ver=v1`
+    );
+    const tag = ((json && json.result) || {}).tag || [];
+    return tag.filter((t) => t.spid || t.season_id).map((t) => ({
+      seasonId: String(t.spid || t.season_id), title: stripEm(t.value || t.name), typeName: "",
+      epSize: 0, cover: "", from: "suggest",
+    }));
+  });
+
+  const r = await Promise.allSettled(tasks.map((f) => f()));
+  for (const x of r) if (x.status === "fulfilled") push(x.value);
+  return out;
+}
+
 // 入口 2：PGC 季库搜索（番剧/影视/纪录片/国创/电视剧）
 async function viaPgcSearch(keyword) {
   const out = [];
@@ -353,6 +422,7 @@ async function searchAll(keyword) {
   const settled = await Promise.allSettled([
     viaWebSearch(keyword, "media_ft", true),
     viaWebSearch(keyword, "media_bangumi", true),
+    viaAltSearch(keyword),
     viaHtmlSearch(keyword),
     viaPgcIndex(keyword),
     viaAppSearch(keyword),
@@ -371,11 +441,22 @@ async function searchAll(keyword) {
   return relevant;
 }
 
+// ---------- 直通：粘贴 B 站链接 / ss号 / ep号 直接命中 ----------
+// 搜索接口被机房 IP 风控时，这是唯一稳定可用的入口。
+// 用户在播放器搜索框里贴 https://www.bilibili.com/bangumi/play/ss218526 即可。
+function parseDirectTarget(s) {
+  const str = String(s || "").trim();
+  let m;
+  if ((m = str.match(/\bep(\d{4,})/i))) return { kind: "ep", id: m[1] };
+  if ((m = str.match(/(?:ss|\/media\/md)(\d{2,})/i))) return { kind: "ss", id: m[1] };
+  if (/^\d{2,8}$/.test(str)) return { kind: "ss", id: str };
+  return null;
+}
+
 // ---------- 分集：pgc/view/web/season ----------
-async function getSeasonEpisodes(seasonId) {
-  const { json } = await bjson(
-    `https://api.bilibili.com/pgc/view/web/season?season_id=${encodeURIComponent(seasonId)}`
-  );
+async function getSeasonEpisodes(seasonId, byEpId = false) {
+  const param = byEpId ? `ep_id=${encodeURIComponent(seasonId)}` : `season_id=${encodeURIComponent(seasonId)}`;
+  const { json } = await bjson(`https://api.bilibili.com/pgc/view/web/season?${param}`);
   const r = (json && json.result) || null;
   if (!r) return null;
 
@@ -536,6 +617,7 @@ async function handleProbe2(res, keyword) {
   await t("web_media_ft_cookie", () => viaWebSearch(keyword, "media_ft", true));
   await t("web_media_bangumi", () => viaWebSearch(keyword, "media_bangumi"));
   await t("web_bangumi_cookie", () => viaWebSearch(keyword, "media_bangumi", true));
+  await t("alt", () => viaAltSearch(keyword));
   await t("html", () => viaHtmlSearch(keyword));
   await t("pgc_index", () => viaPgcIndex(keyword));
   await t("app", () => viaAppSearch(keyword));
@@ -598,6 +680,38 @@ export default async function handler(req, res) {
     const anime = (sp.get("anime") || "").trim();
     const epNo = sp.get("episode");
     if (!anime) return send(res, 200, { success: false, errorCode: 400, errorMessage: "anime required", animes: [] });
+
+    // 先判是不是「贴了 B 站链接/ID」——这类直接命中，不走搜索引擎
+    const direct = parseDirectTarget(anime);
+    if (direct) {
+      try {
+        const d = await getSeasonEpisodes(direct.id, direct.kind === "ep");
+        if (d && d.episodes.length) {
+          const eps = d.episodes.map((e) => ({
+            episodeId: e.epId,
+            episodeTitle: e.title,
+            episodeNumber: String(e.index),
+            url: `https://www.bilibili.com/bangumi/play/ep${e.epId}`,
+          }));
+          return send(res, 200, {
+            success: true,
+            errorCode: 0,
+            errorMessage: "",
+            animes: [
+              {
+                animeId: Number(d.seasonId) || 0,
+                animeTitle: `${d.title}【${d.typeName || "B站"}】from bili`,
+                type: "bili",
+                typeDescription: d.typeName || "",
+                episodes: eps,
+              },
+            ],
+          }, ttlFor("/v2/search/"));
+        }
+      } catch {
+        // 落到关键词搜索
+      }
+    }
 
     try {
       let list = await searchAll(anime);
