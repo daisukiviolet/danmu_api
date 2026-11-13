@@ -208,6 +208,23 @@ async function viaAppSearch(keyword) {
   return out;
 }
 
+// 标题相关性判断。
+// PGC 季库与 App 搜索在没有关键词命中时会回落成「热门列表」，
+// 不拦的话搜「蜘蛛侠」会返回名侦探柯南。宁可返回空，也不能返回错条目。
+function isRelevant(title, keyword) {
+  const t = String(title || "").replace(/\s+/g, "").toLowerCase();
+  const k = String(keyword || "").replace(/\s+/g, "").toLowerCase();
+  if (!t || !k) return false;
+  if (t.includes(k) || k.includes(t)) return true;
+  // 取 min(3, 关键词长度) 个连续字符作为匹配单元
+  const need = Math.min(3, k.length);
+  if (need < 2) return false;
+  for (let i = 0; i + need <= k.length; i++) {
+    if (t.includes(k.slice(i, i + need))) return true;
+  }
+  return false;
+}
+
 async function searchAll(keyword) {
   const results = [];
   const push = (arr) => {
@@ -234,7 +251,14 @@ async function searchAll(keyword) {
   ]);
   for (const r of [w1, w2, app, pgc]) if (r.status === "fulfilled") push(r.value);
 
-  return results;
+  // 入口污染过滤：只保留标题与关键词相关的条目
+  const relevant = results.filter((r) => isRelevant(r.title, keyword));
+  // web 入口命中优先（正规搜索接口，排序最准）
+  relevant.sort((a, b) => {
+    const rank = (x) => (x.from.includes("web") ? 0 : x.from.includes("app") ? 1 : 2);
+    return rank(a) - rank(b);
+  });
+  return relevant;
 }
 
 // ---------- 分集：pgc/view/web/season ----------
@@ -377,6 +401,58 @@ async function handleProbe(res, target) {
   }
 }
 
+// 逐个入口单测：返回每个入口的原始结果，用于定位是哪个入口在污染关键词
+async function handleProbe2(res, keyword) {
+  const out = {};
+  const t = async (name, fn) => {
+    const t0 = Date.now();
+    try {
+      const r = await fn();
+      out[name] = {
+        ms: Date.now() - t0,
+        n: Array.isArray(r) ? r.length : null,
+        titles: (Array.isArray(r) ? r : []).slice(0, 6).map((x) => x.title),
+        ids: (Array.isArray(r) ? r : []).slice(0, 6).map((x) => x.seasonId),
+      };
+    } catch (e) {
+      out[name] = { ms: Date.now() - t0, error: (e && e.message) || String(e) };
+    }
+  };
+
+  const mixin = await getMixinKey();
+  out._mixinKey = mixin ? mixin.slice(0, 8) + "…(len " + mixin.length + ")" : "FAILED";
+
+  await t("web_media_ft", () => viaWebSearch(keyword, "media_ft"));
+  await t("web_media_bangumi", () => viaWebSearch(keyword, "media_bangumi"));
+  await t("app", () => viaAppSearch(keyword));
+  await t("pgc", () => viaPgcSearch(keyword));
+
+  // 原始返回，不经解析，用来判断接口本身给的是不是空
+  const raw = {};
+  const qs = mixin
+    ? Object.keys({ keyword, search_type: "media_ft", wts: Math.floor(Date.now() / 1000) })
+        .sort()
+        .join("|")
+    : "";
+  try {
+    const s = await signedWbi({ keyword, search_type: "media_ft" });
+    const { status, buf } = await bfetch(`https://api.bilibili.com/x/web-interface/wbi/search/type?${s}`);
+    const j = JSON.parse(buf.toString("utf8"));
+    raw.wbi_search_media_ft = {
+      status,
+      code: j.code,
+      message: j.message,
+      numResults: j.data && j.data.numResults,
+      resultLen: j.data && j.data.result ? j.data.result.length : null,
+      signedParams: s ? s.slice(0, 90) : null,
+    };
+  } catch (e) {
+    raw.wbi_search_media_ft = { error: (e && e.message) || String(e) };
+  }
+
+  return send(res, 200, { keyword, entries: out, raw });
+}
+
 export default async function handler(req, res) {
   const rawUrl = req.url || "/";
   const qi = rawUrl.indexOf("?");
@@ -387,6 +463,9 @@ export default async function handler(req, res) {
   // 探测入口
   if (path === "/bili/_probe" || path === "/_probe") {
     return handleProbe(res, sp.get("u") || "");
+  }
+  if (path === "/bili/_probe2" || path === "/_probe2") {
+    return handleProbe2(res, sp.get("keyword") || "");
   }
 
   // 剥前缀
@@ -417,8 +496,8 @@ export default async function handler(req, res) {
         list = await searchAll(anime.slice(0, 12));
       }
       const animes = [];
-      // 最多取 8 个候选的分集，避免一次搜索打太多请求把函数拖过 10s
-      for (const it of list.slice(0, 8)) {
+      // 最多取 5 个候选的分集：候选越多，拉详情的请求越多，容易把函数拖过 10s
+      for (const it of list.slice(0, 5)) {
         let detail = null;
         try {
           detail = await getSeasonEpisodes(it.seasonId);
