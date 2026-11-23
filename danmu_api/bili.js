@@ -11,6 +11,7 @@
 
 // package.json 是 type:module，只能用 import，不能用 require
 import crypto from "node:crypto";
+import zlib from "node:zlib";
 
 // 片名 → season_id 映射表。B 站搜索被封的绕行方案，详见 bili-map.js 注释
 import SEASON_MAP from "./bili-map.js";
@@ -706,7 +707,7 @@ async function resolveSeason(idRaw) {
   return null;
 }
 
-// ---------- 弹幕：转发给 worker 的 comment?url=（该路径已验证可达） ----------
+// ---------- 弹幕：list.so 全量优先，worker 转发兜底 ----------
 function guessHost(req) {
   const h = req.headers["x-forwarded-host"] || req.headers.host || "";
   return String(h).split(",")[0].trim();
@@ -727,6 +728,104 @@ async function forwardComment(req, epId) {
     "&withRelated=true&chConvert=0";
   const { status, buf } = await bfetch(inner, { timeout: 30000 });
   return { status, buf };
+}
+
+// B 站响应可能是明文 / gzip / raw-deflate 三种之一，按顺序试
+function inflateBuf(buf) {
+  for (const fn of [zlib.gunzipSync, zlib.inflateRawSync, zlib.inflateSync]) {
+    try {
+      return fn(buf);
+    } catch {
+      // 换下一种
+    }
+  }
+  return buf;
+}
+
+function xmlUnescape(s) {
+  return String(s)
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
+    .replace(/&amp;/g, "&");
+}
+
+// x/v1/dm/list.so 是弹幕池的 XML 快照，一次请求给整池。
+// 为什么不用 seg.so：那个接口每段被服务端截到 400~500 条（实测 25 段合计 5870），
+// 而同一集 list.so 一次给 9600 条 —— seg 的分段截断才是「官方 16000 我只拿到 5000」的原因。
+// 16000 是页面上的历史累计数（含已折叠/被清理的），实际存活并能下发的就是这 9000 多条。
+async function fetchXmlComments(cid) {
+  const { status, buf } = await bfetch(
+    `https://api.bilibili.com/x/v1/dm/list.so?oid=${encodeURIComponent(cid)}`,
+    { timeout: 15000, headers: { Accept: "*/*" } }
+  );
+  if (status !== 200) return [];
+
+  const text = inflateBuf(buf).toString("utf8");
+  if (!text.includes("<d p=")) return [];
+
+  const comments = [];
+  const re = /<d p="([^"]*)"[^>]*>([\s\S]*?)<\/d>/g;
+  let m;
+  while ((m = re.exec(text))) {
+    const p = m[1].split(",");
+    const time = Number(p[0]) || 0;
+    const mode = Number(p[1]) || 1;
+    const color = Number(p[3]) || 16777215;
+    comments.push({
+      // cid 只是条目序号（弹弹play 这边不校验），不用 dmid：
+      // dmid 是 19 位整数，超过 JS 安全整数范围，序列化会掉精度
+      cid: comments.length + 1,
+      p: `${time},${mode},${color},[bilibili1]`,
+      m: xmlUnescape(m[2]),
+      t: time,
+    });
+  }
+  // XML 是乱序的，按时间排好，客户端直接顺序消费
+  comments.sort((a, b) => a.t - b.t);
+  // 排序后重新编号，保证 cid 连续且唯一
+  comments.forEach((c, i) => {
+    c.cid = i + 1;
+  });
+  return comments;
+}
+
+// epId → cid → 全量弹幕；拿不到就回落到 worker（BV 号等分支还在那边）
+async function buildComments(req, epId) {
+  let cid = "";
+  try {
+    const d = await getSeasonEpisodes(epId, true);
+    if (d && d.episodes.length) {
+      const ep = d.episodes.find((e) => e.epId === String(epId)) || d.episodes[0];
+      cid = ep && ep.cid ? ep.cid : "";
+    }
+  } catch {
+    cid = "";
+  }
+
+  if (cid) {
+    try {
+      const comments = await fetchXmlComments(cid);
+      if (comments.length > 0) {
+        return { count: comments.length, comments, errorCode: 0, errorMessage: "" };
+      }
+    } catch {
+      // 落到 worker
+    }
+  }
+
+  const r = await forwardComment(req, epId);
+  if (r.status === 200) {
+    try {
+      return JSON.parse(r.buf.toString("utf8"));
+    } catch {
+      // worker 返回不是 JSON
+    }
+  }
+  return { count: 0, comments: [], errorCode: 0, errorMessage: "" };
 }
 
 // ---------- HTTP 辅助 ----------
@@ -1189,15 +1288,8 @@ export default async function handler(req, res) {
       return send(res, 200, { count: 0, comments: [], errorCode: 0, errorMessage: "" });
     }
     try {
-      const r = await forwardComment(req, epId);
-      res.statusCode = r.status;
-      res.setHeader("Content-Type", "application/json; charset=utf-8");
-      if (r.status === 200) {
-        res.setHeader("Cache-Control", `public, s-maxage=${ttlFor("/v2/comment/")}, stale-while-revalidate=86400`);
-      } else {
-        res.setHeader("Cache-Control", "no-store");
-      }
-      return res.end(r.buf);
+      const body = await buildComments(req, epId);
+      return send(res, 200, body, ttlFor("/v2/comment/"));
     } catch (e) {
       return send(res, 502, { count: 0, comments: [], errorCode: -1, errorMessage: String((e && e.message) || e) });
     }
