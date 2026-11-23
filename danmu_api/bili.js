@@ -753,18 +753,49 @@ function xmlUnescape(s) {
     .replace(/&amp;/g, "&");
 }
 
+// 只挑鉴权相关的几个 key，别把无关 cookie 带上去触发校验
+function biliCookieHeader() {
+  const cookie = process.env.BILIBILI_COOKIE || "";
+  if (!cookie) return "";
+  const keep = cookie
+    .split(";")
+    .map((s) => s.trim())
+    .filter((s) => /^(SESSDATA|bili_jct|DedeUserID|buvid3|buvid4)=/.test(s));
+  return keep.join("; ");
+}
+
+// 拉一次 list.so 的原始 XML：返回 { status, text, count, maxlimit }
+async function fetchListSo(cid, withCookie) {
+  const headers = { Accept: "*/*" };
+  const ck = withCookie ? biliCookieHeader() : "";
+  if (ck) headers.Cookie = ck;
+  const { status, buf } = await bfetch(
+    `https://api.bilibili.com/x/v1/dm/list.so?oid=${encodeURIComponent(cid)}`,
+    { timeout: 15000, headers }
+  );
+  const text = status === 200 ? inflateBuf(buf).toString("utf8") : "";
+  const count = (text.match(/<d p=/g) || []).length;
+  const ml = text.match(/<maxlimit>(\d+)<\/maxlimit>/);
+  return { status, text, count, maxlimit: ml ? ml[1] : "", bytes: buf.length, usedCookie: !!ck };
+}
+
 // x/v1/dm/list.so 是弹幕池的 XML 快照，一次请求给整池。
 // 为什么不用 seg.so：那个接口每段被服务端截到 400~500 条（实测 25 段合计 5870），
 // 而同一集 list.so 一次给 9600 条 —— seg 的分段截断才是「官方 16000 我只拿到 5000」的原因。
-// 16000 是页面上的历史累计数（含已折叠/被清理的），实际存活并能下发的就是这 9000 多条。
+// 先带登录 Cookie 试（大会员/登录态可能放宽池上限），失败或更少再退回匿名请求。
 async function fetchXmlComments(cid) {
-  const { status, buf } = await bfetch(
-    `https://api.bilibili.com/x/v1/dm/list.so?oid=${encodeURIComponent(cid)}`,
-    { timeout: 15000, headers: { Accept: "*/*" } }
-  );
-  if (status !== 200) return [];
-
-  const text = inflateBuf(buf).toString("utf8");
+  let best = { text: "", count: 0 };
+  for (const withCookie of [true, false]) {
+    if (withCookie && !biliCookieHeader()) continue;
+    try {
+      const r = await fetchListSo(cid, withCookie);
+      if (r.count > best.count) best = r;
+      if (r.count > 0) break;
+    } catch {
+      // 换下一种身份
+    }
+  }
+  const text = best.text;
   if (!text.includes("<d p=")) return [];
 
   const comments = [];
@@ -1068,6 +1099,49 @@ async function handleDmStat(res, epId) {
   });
 }
 
+// list.so 身份对比：同一个 cid，匿名与带登录 Cookie 各拉一次。
+// 用途：判断 9600 是接口硬上限，还是「未登录」被限流。
+// 如果 withCookie 明显更多，说明把 BILIBILI_COOKIE 配全（SESSDATA+buvid3+bili_jct+DedeUserID）还能再涨。
+async function handleDmStat2(res, param) {
+  let cid = String(param || "").replace(/\D/g, "");
+  let title = "";
+  // ep 号是 7 位，cid 是 11 位；短的先试着当 ep 换 cid
+  if (cid && cid.length <= 8) {
+    try {
+      const d = await getSeasonEpisodes(cid, true);
+      if (d && d.episodes.length) {
+        const ep = d.episodes.find((e) => e.epId === cid) || d.episodes[0];
+        if (ep && ep.cid) {
+          title = `${d.title} ${ep.title}`;
+          cid = ep.cid;
+        }
+      }
+    } catch {
+      // 当 cid 用
+    }
+  }
+  if (!cid) return send(res, 200, { success: false, errorMessage: "cid 或 ep 参数必填" });
+
+  const out = { success: true, cid, title, hasEnvCookie: !!biliCookieHeader() };
+  for (const withCookie of [false, true]) {
+    if (withCookie && !biliCookieHeader()) continue;
+    const t0 = Date.now();
+    try {
+      const r = await fetchListSo(cid, withCookie);
+      out[withCookie ? "withCookie" : "noCookie"] = {
+        status: r.status,
+        count: r.count,
+        maxlimit: r.maxlimit,
+        bytes: r.bytes,
+        ms: Date.now() - t0,
+      };
+    } catch (e) {
+      out[withCookie ? "withCookie" : "noCookie"] = { error: (e && e.message) || String(e) };
+    }
+  }
+  return send(res, 200, out);
+}
+
 // HTML 搜索页诊断：确认页面是否真的含 season_id，还是被拦成空壳/验证页
 async function handleProbe3(res, keyword) {
   const out = {};
@@ -1140,6 +1214,9 @@ export default async function handler(req, res) {
   }
   if (path === "/bili/_dmstat" || path === "/_dmstat") {
     return handleDmStat(res, sp.get("ep") || "");
+  }
+  if (path === "/bili/_dmstat2" || path === "/_dmstat2") {
+    return handleDmStat2(res, sp.get("cid") || sp.get("ep") || "");
   }
 
   // 剥前缀
