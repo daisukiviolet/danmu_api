@@ -824,6 +824,104 @@ async function fetchXmlComments(cid) {
   return comments;
 }
 
+// seg.so 单段：解析 protobuf，取 (progress 毫秒, 内容)
+// 用途只有一个 —— 补 list.so 没抽到的那批。
+// 实测同一集 list 9572 条、seg 5823 条，seg 里有 1499 条是 list 完全没有的：
+// 两个接口的抽样策略不同（list 按权重取整池快照，seg 按时间窗取段），
+// 合起来 11071 条，比只用 list 多 15%。
+async function fetchSegOne(cid, segIndex) {
+  const headers = { Accept: "*/*" };
+  const ck = biliCookieHeader();
+  if (ck) headers.Cookie = ck;
+  const { status, buf } = await bfetch(
+    `https://api.bilibili.com/x/v2/dm/web/seg.so?type=1&oid=${encodeURIComponent(cid)}&segment_index=${segIndex}`,
+    { timeout: 10000, headers }
+  );
+  if (status !== 200) return [];
+
+  const body = inflateBuf(buf);
+  const out = [];
+  let i = 0;
+  const varint = (b, p) => {
+    let r = 0, s = 0;
+    while (p < b.length) {
+      const x = b[p++];
+      r |= (x & 0x7f) << s;
+      s += 7;
+      if (!(x & 0x80)) return [r, p];
+    }
+    return [r, p];
+  };
+
+  while (i < body.length) {
+    let k, w, f;
+    [k, i] = varint(body, i);
+    f = k >>> 3;
+    w = k & 7;
+    if (w === 2) {
+      let ln;
+      [ln, i] = varint(body, i);
+      const msg = body.subarray(i, i + ln);
+      i += ln;
+      if (f !== 1) continue;
+      // DanmakuElem: field 2 = progress(ms), field 7 = content
+      let j = 0, prog = null, text = null, mode = null, color = null;
+      while (j < msg.length) {
+        let t, ww, ff;
+        [t, j] = varint(msg, j);
+        ff = t >>> 3;
+        ww = t & 7;
+        if (ww === 0) {
+          let v;
+          [v, j] = varint(msg, j);
+          if (ff === 2) prog = v;
+          else if (ff === 3) mode = v;
+          else if (ff === 5) color = v;
+        } else if (ww === 2) {
+          let l2;
+          [l2, j] = varint(msg, j);
+          const val = msg.subarray(j, j + l2);
+          j += l2;
+          if (ff === 7) text = val.toString("utf8");
+        } else if (ww === 5) j += 4;
+        else if (ww === 1) j += 8;
+        else break;
+      }
+      if (prog !== null && text) {
+        out.push({ t: Number((prog / 1000).toFixed(2)), m: text, mode: mode || 1, color: color || 16777215 });
+      }
+    } else if (w === 0) {
+      let v;
+      [v, i] = varint(body, i);
+    } else if (w === 5) i += 4;
+    else if (w === 1) i += 8;
+    else break;
+  }
+  return out;
+}
+
+// 25 段并发拉取（6 并发），任一段失败不中断 —— worker 那边是「一段失败就丢弃后续全部」，
+// 正是它只拿到 5000 多的原因之一。
+async function fetchSegComments(cid) {
+  const out = [];
+  const CONC = 6;
+  for (let start = 1; start <= 33; start += CONC) {
+    const batch = [];
+    for (let i = start; i < start + CONC && i <= 33; i++) batch.push(i);
+    const rs = await Promise.allSettled(batch.map((i) => fetchSegOne(cid, i)));
+    let got = 0;
+    for (const r of rs) {
+      if (r.status === "fulfilled" && r.value.length) {
+        out.push(...r.value);
+        got += r.value.length;
+      }
+    }
+    // 第一批之后整批全空，说明已经超出视频时长，停
+    if (got === 0 && start > 1) break;
+  }
+  return out;
+}
+
 // epId → cid → 全量弹幕；拿不到就回落到 worker（BV 号等分支还在那边）
 async function buildComments(req, epId) {
   let cid = "";
@@ -839,9 +937,38 @@ async function buildComments(req, epId) {
 
   if (cid) {
     try {
-      const comments = await fetchXmlComments(cid);
-      if (comments.length > 0) {
-        return { count: comments.length, comments, errorCode: 0, errorMessage: "" };
+      // list.so 与 seg.so 并行拉，两边配额覆盖的条目不一样，合并去重
+      const [xmlList, segList] = await Promise.all([
+        fetchXmlComments(cid).catch(() => []),
+        fetchSegComments(cid).catch(() => []),
+      ]);
+
+      if (xmlList.length || segList.length) {
+        // list 优先入表；seg 用 (时间精确到 10ms + 内容) 去重后补进去
+        const seen = new Set();
+        const merged = [];
+        for (const c of xmlList) {
+          const key = `${c.t.toFixed(2)}|${c.m}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          merged.push(c);
+        }
+        for (const c of segList) {
+          const key = `${c.t.toFixed(2)}|${c.m}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          merged.push({
+            cid: 0,
+            p: `${c.t},${c.mode},${c.color},[bilibili1]`,
+            m: c.m,
+            t: c.t,
+          });
+        }
+        merged.sort((a, b) => a.t - b.t);
+        merged.forEach((c, i) => {
+          c.cid = i + 1;
+        });
+        return { count: merged.length, comments: merged, errorCode: 0, errorMessage: "" };
       }
     } catch {
       // 落到 worker
